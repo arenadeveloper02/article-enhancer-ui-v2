@@ -1,11 +1,8 @@
-import { NextResponse } from 'next/server';
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
-
-const SIM_API_KEY = 'sk-sim-jYKjvV7VAToCX_MNfI00-2sGNmcyDZAS';
-const UPSTREAM_URL =
-  'https://test-agent.thearena.ai/api/workflows/9aafe5d7-1d24-477a-ad3f-0be9bf79c04f/execute';
+const SIM_API_KEY = 'sk-sim-jYKjvV7VAToCX_MNfI00-2sGNmcyDZAS'
+const WORKFLOW_URL = 'https://test-agent.thearena.ai/api/workflows/9aafe5d7-1d24-477a-ad3f-0be9bf79c04f/execute'
 
 const SELECTED_OUTPUTS = [
   'recommendations.recommendations',
@@ -17,36 +14,31 @@ const SELECTED_OUTPUTS = [
   'gapanalysis.competitor_strengths',
   'gapanalysis.coverage_gaps',
   'gapanalysis.underdeveloped_sections',
-];
-
-interface EnhanceRequestPayload {
-  article_url?: unknown;
-  article_text?: unknown;
-  content_type?: unknown;
-}
+]
 
 export async function POST(request: Request): Promise<Response> {
-  let payload: EnhanceRequestPayload;
+  let raw: unknown
   try {
-    payload = (await request.json()) as EnhanceRequestPayload;
+    raw = await request.json()
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
+    return Response.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
 
-  const articleUrl = typeof payload.article_url === 'string' ? payload.article_url.trim() : '';
-  const articleText = typeof payload.article_text === 'string' ? payload.article_text.trim() : '';
-  const contentType = typeof payload.content_type === 'string' ? payload.content_type.trim() : '';
+  const body = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
+  const articleUrl = typeof body.article_url === 'string' ? body.article_url : ''
+  const articleText = typeof body.article_text === 'string' ? body.article_text : ''
+  const contentType = typeof body.content_type === 'string' ? body.content_type : ''
 
   if (!articleUrl || !articleText || !contentType) {
-    return NextResponse.json(
-      { error: 'article_url, article_text and content_type are all required.' },
+    return Response.json(
+      { error: 'article_url, article_text and content_type are required' },
       { status: 400 }
-    );
+    )
   }
 
-  let upstream: Response;
+  let upstream: Response
   try {
-    upstream = await fetch(UPSTREAM_URL, {
+    upstream = await fetch(WORKFLOW_URL, {
       method: 'POST',
       headers: {
         'X-API-Key': SIM_API_KEY,
@@ -59,36 +51,30 @@ export async function POST(request: Request): Promise<Response> {
         stream: true,
         selectedOutputs: SELECTED_OUTPUTS,
       }),
-    });
-  } catch {
-    return NextResponse.json(
-      { error: 'Failed to reach the enhancement service. Please try again.' },
-      { status: 502 }
-    );
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to reach the enhancement service'
+    return Response.json({ error: message }, { status: 502 })
   }
 
   if (!upstream.ok) {
-    const errorText = await upstream.text();
-    return new Response(errorText || `Upstream error (${upstream.status})`, {
+    const text = await upstream.text()
+    return new Response(text || `Upstream error (${upstream.status})`, {
       status: upstream.status,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-    });
+    })
   }
 
-  const upstreamContentType = upstream.headers.get('content-type') ?? '';
-  if (upstreamContentType.includes('application/json')) {
-    // Non-streamed fallback: forward the JSON as-is.
-    const jsonText = await upstream.text();
-    return new Response(jsonText, {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+  const upstreamType = upstream.headers.get('content-type') ?? ''
+  if (upstreamType.includes('application/json')) {
+    const json = await upstream.text()
+    return new Response(json, { headers: { 'Content-Type': 'application/json' } })
   }
 
   if (!upstream.body) {
-    return NextResponse.json({ error: 'Upstream returned no stream body.' }, { status: 502 });
+    return Response.json({ error: 'Upstream returned an empty body' }, { status: 502 })
   }
 
-  // Pipe the upstream stream straight through — never buffer the whole body.
   return new Response(upstream.body, {
     headers: {
       'Content-Type': 'text/event-stream',
@@ -96,5 +82,5 @@ export async function POST(request: Request): Promise<Response> {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     },
-  });
+  })
 }

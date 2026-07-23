@@ -1,382 +1,347 @@
 "use client"
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { AlertTriangle, RotateCcw, Sparkles } from 'lucide-react'
 import type {
   EnhanceInput,
-  RunStatus,
-  StageItem,
+  RunPhase,
+  SectionBuffers,
+  SectionStatus,
   StageKey,
   StageStatus,
-} from '@/lib/types';
+} from '@/lib/types'
 import {
-  decodeUnicodeEscapes,
-  findValueByKey,
+  decodeEscapes,
+  detectFallbackTarget,
+  extractFallbackBuffers,
   isHeartbeatText,
+  parseCoverage,
+  parseGapAnalysis,
+  parseRecommendations,
   resolveBlockTarget,
-} from '@/lib/stream';
-import ArticleForm from '@/components/ArticleForm';
-import ProgressChecklist from '@/components/ProgressChecklist';
-import StatusChip from '@/components/StatusChip';
-import GapAnalysisCard from '@/components/GapAnalysisCard';
-import RecommendationsCard from '@/components/RecommendationsCard';
-import EnhancedArticleCard from '@/components/EnhancedArticleCard';
-import CoverageCard from '@/components/CoverageCard';
-import ErrorCard from '@/components/ErrorCard';
+} from '@/lib/stream'
+import ArticleForm from '@/components/ArticleForm'
+import ProgressChecklist from '@/components/ProgressChecklist'
+import StatusChip from '@/components/StatusChip'
+import EnhancedArticleSection from '@/components/EnhancedArticleSection'
+import GapAnalysisSection from '@/components/GapAnalysisSection'
+import RecommendationsSection from '@/components/RecommendationsSection'
+import CoverageSection from '@/components/CoverageSection'
 
-const STAGE_ORDER: StageKey[] = ['gap', 'recommendations', 'article', 'coverage'];
+const STAGE_KEYS: StageKey[] = ['gap', 'recs', 'article', 'coverage']
 
-const STAGE_LABELS: Record<StageKey, string> = {
-  gap: 'Analyzing gaps',
-  recommendations: 'Generating recommendations',
-  article: 'Writing enhanced draft',
-  coverage: 'Verifying coverage',
-};
+const STAGE_STATUS_TEXT: Record<StageKey, string> = {
+  gap: 'Analyzing gaps\u2026',
+  recs: 'Generating recommendations\u2026',
+  article: 'Writing enhanced draft\u2026',
+  coverage: 'Verifying coverage\u2026',
+}
 
-const STAGE_STATUS_MESSAGES: Record<StageKey, string> = {
-  gap: 'Analyzing content gaps…',
-  recommendations: 'Generating recommendations…',
-  article: 'Writing the enhanced draft…',
-  coverage: 'Verifying coverage…',
-};
+const EMPTY_BUFFERS: SectionBuffers = { gap: '', recs: '', article: '', coverage: '' }
 
-type PanelState = Record<StageKey, string>;
-
-const EMPTY_PANELS: PanelState = { gap: '', recommendations: '', article: '', coverage: '' };
-
-const PENDING_STAGES: Record<StageKey, StageStatus> = {
+const INITIAL_STAGES: Record<StageKey, StageStatus> = {
   gap: 'pending',
-  recommendations: 'pending',
+  recs: 'pending',
   article: 'pending',
   coverage: 'pending',
-};
+}
 
 export default function EnhancerClient() {
-  const [status, setStatus] = useState<RunStatus>('idle');
-  const [stages, setStages] = useState<Record<StageKey, StageStatus>>(PENDING_STAGES);
-  const [panels, setPanels] = useState<PanelState>(EMPTY_PANELS);
-  const [statusMessage, setStatusMessage] = useState('');
-  const [elapsed, setElapsed] = useState(0);
-  const [errorMessage, setErrorMessage] = useState('');
+  const [phase, setPhase] = useState<RunPhase>('idle')
+  const [sections, setSections] = useState<SectionBuffers>(EMPTY_BUFFERS)
+  const [stages, setStages] = useState<Record<StageKey, StageStatus>>(INITIAL_STAGES)
+  const [statusMessage, setStatusMessage] = useState('')
+  const [elapsed, setElapsed] = useState(0)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
-  const accRef = useRef<Record<string, string>>({});
-  const abortRef = useRef<AbortController | null>(null);
-  const lastInputRef = useRef<EnhanceInput | null>(null);
+  const buffersRef = useRef<SectionBuffers>({ ...EMPTY_BUFFERS })
+  const unknownRef = useRef<Record<string, string>>({})
+  const unknownMapRef = useRef<Record<string, StageKey>>({})
+  const activeStageRef = useRef<StageKey | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const lastInputRef = useRef<EnhanceInput | null>(null)
 
-  // Live elapsed-time counter that ticks every second while streaming.
   useEffect(() => {
-    if (status !== 'running') return;
-    const startedAt = Date.now();
-    const intervalId = window.setInterval(() => {
-      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
-    }, 1000);
-    return () => window.clearInterval(intervalId);
-  }, [status]);
+    if (phase !== 'running') return
+    const started = Date.now()
+    setElapsed(0)
+    const id = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - started) / 1000))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [phase])
 
-  // Abort any in-flight request when the component unmounts.
   useEffect(() => {
-    return () => {
-      abortRef.current?.abort();
-    };
-  }, []);
+    return () => abortRef.current?.abort()
+  }, [])
 
-  const markStageActive = (key: StageKey) => {
+  const markStageActive = (stage: StageKey) => {
+    if (activeStageRef.current === stage) return
+    const previous = activeStageRef.current
+    activeStageRef.current = stage
     setStages((prev) => {
-      if (prev[key] !== 'pending') return prev;
-      const next = { ...prev };
-      const index = STAGE_ORDER.indexOf(key);
-      STAGE_ORDER.forEach((stageKey, i) => {
-        if (i < index && next[stageKey] === 'active') next[stageKey] = 'done';
-      });
-      next[key] = 'active';
-      return next;
-    });
-  };
+      const next = { ...prev }
+      if (previous && next[previous] === 'active') next[previous] = 'done'
+      if (next[stage] === 'pending') next[stage] = 'active'
+      return next
+    })
+  }
 
-  const finalizeRun = () => {
+  const appendToSection = (target: StageKey, chunk: string) => {
+    const next: SectionBuffers = { ...buffersRef.current }
+    next[target] = next[target] + chunk
+    buffersRef.current = next
+    setSections(next)
+    markStageActive(target)
+  }
+
+  const finishRun = () => {
     setStages((prev) => {
-      const next = { ...prev };
-      STAGE_ORDER.forEach((stageKey) => {
-        if (next[stageKey] === 'active') next[stageKey] = 'done';
-      });
-      return next;
-    });
-    setStatus('done');
-    setStatusMessage('Enhancement complete');
-  };
+      const next = { ...prev }
+      for (const key of STAGE_KEYS) {
+        if (buffersRef.current[key].trim().length > 0 || next[key] === 'active') {
+          next[key] = 'done'
+        }
+      }
+      return next
+    })
+    setStatusMessage('Enhancement complete')
+    setPhase('done')
+  }
 
-  const handleChunk = (blockId: string, chunk: string) => {
-    accRef.current[blockId] = (accRef.current[blockId] ?? '') + chunk;
-    const accumulated = accRef.current[blockId];
-    const target = resolveBlockTarget(blockId, accumulated);
+  const processLine = (line: string): boolean => {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) return false
+    const payload = trimmed.slice(5).trim()
+    if (payload === '[DONE]') return true
 
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      return false
+    }
+    if (typeof parsed !== 'object' || parsed === null) return false
+    const record = parsed as Record<string, unknown>
+    const blockId = typeof record.blockId === 'string' ? record.blockId : null
+    const chunk = typeof record.chunk === 'string' ? record.chunk : null
+
+    if (!blockId || chunk === null) {
+      const candidates = [record.message, record.status, record.event]
+      for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+          setStatusMessage(decodeEscapes(candidate).trim())
+          break
+        }
+      }
+      return false
+    }
+
+    if (isHeartbeatText(chunk)) {
+      setStatusMessage(decodeEscapes(chunk).trim())
+      return false
+    }
+
+    const target = resolveBlockTarget(blockId)
     if (target === 'theme') {
-      setStatusMessage('Extracting article themes…');
-      return;
+      setStatusMessage('Extracting article themes\u2026')
+      return false
     }
     if (target === 'research') {
-      setStatusMessage('Researching competitor coverage…');
-      return;
+      setStatusMessage('Researching competitors (Exa)\u2026')
+      return false
     }
-    if (target === 'unknown') {
-      // Heartbeats and unclassified short blobs go to the status chip, never to content.
-      const lines = accumulated.trim().split('\n');
-      const lastLine = (lines.length > 0 ? lines[lines.length - 1] : '').trim();
-      if (lastLine && isHeartbeatText(lastLine)) {
-        setStatusMessage(decodeUnicodeEscapes(lastLine));
-      }
-      return;
+    if (target) {
+      setStatusMessage(STAGE_STATUS_TEXT[target])
+      appendToSection(target, chunk)
+      return false
     }
 
-    markStageActive(target);
-    setStatusMessage(STAGE_STATUS_MESSAGES[target]);
-    const decoded = decodeUnicodeEscapes(accumulated);
-    setPanels((prev) => ({ ...prev, [target]: decoded }));
-  };
+    const mapped = unknownMapRef.current[blockId]
+    if (mapped) {
+      appendToSection(mapped, chunk)
+      return false
+    }
+    unknownRef.current[blockId] = (unknownRef.current[blockId] ?? '') + chunk
+    const detected = detectFallbackTarget(unknownRef.current[blockId])
+    if (detected) {
+      unknownMapRef.current[blockId] = detected
+      appendToSection(detected, unknownRef.current[blockId])
+      delete unknownRef.current[blockId]
+    }
+    return false
+  }
 
-  // Returns true when the [DONE] sentinel is seen.
-  const processLine = (rawLine: string): boolean => {
-    const line = rawLine.trim();
-    if (!line.startsWith('data:')) return false;
-    const payload = line.slice(5).trim();
-    if (!payload) return false;
-    if (payload === '[DONE]') return true;
-
-    let parsed: unknown;
+  const runStream = async (input: EnhanceInput, controller: AbortController) => {
     try {
-      parsed = JSON.parse(payload);
-    } catch {
-      // Partial or non-JSON line — swallow and continue.
-      return false;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-
-    const event = parsed as Record<string, unknown>;
-    const blockId = typeof event.blockId === 'string' ? event.blockId : null;
-    const chunk = typeof event.chunk === 'string' ? event.chunk : null;
-
-    if (blockId && chunk !== null) {
-      handleChunk(blockId, chunk);
-      return false;
-    }
-
-    // Heartbeat / progress / status events go to the status chip.
-    const message =
-      typeof event.message === 'string'
-        ? event.message
-        : typeof event.status === 'string'
-          ? event.status
-          : typeof event.event === 'string'
-            ? event.event
-            : null;
-    if (message) setStatusMessage(decodeUnicodeEscapes(message));
-    return false;
-  };
-
-  const handleJsonFallback = (text: string) => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      setPanels((prev) => ({ ...prev, article: decodeUnicodeEscapes(text) }));
-      return;
-    }
-
-    const content = findValueByKey(parsed, (k) => k === 'content' || k.endsWith('.content'));
-
-    let recommendations = findValueByKey(
-      parsed,
-      (k) => k === 'recommendations' || k.endsWith('.recommendations')
-    );
-    if (recommendations && typeof recommendations === 'object' && !Array.isArray(recommendations)) {
-      const inner = (recommendations as Record<string, unknown>).recommendations;
-      if (inner !== undefined) recommendations = inner;
-    }
-
-    const gapStrengths = findValueByKey(parsed, (k) => k.includes('competitor_strengths'));
-    const gapGaps = findValueByKey(parsed, (k) => k.includes('coverage_gaps'));
-    const gapSections = findValueByKey(parsed, (k) => k.includes('underdeveloped_sections'));
-
-    const coverageScore = findValueByKey(parsed, (k) => k.includes('overall_score'));
-    const coveragePassed = findValueByKey(parsed, (k) => k === 'passed' || k.endsWith('.passed'));
-    const coverageSummary = findValueByKey(parsed, (k) => k === 'summary' || k.endsWith('.summary'));
-    const coverageCriteria = findValueByKey(parsed, (k) => k === 'criteria' || k.endsWith('.criteria'));
-
-    setPanels((prev) => ({
-      gap:
-        gapStrengths !== undefined || gapGaps !== undefined || gapSections !== undefined
-          ? JSON.stringify({
-              competitor_strengths: gapStrengths ?? [],
-              coverage_gaps: gapGaps ?? [],
-              underdeveloped_sections: gapSections ?? [],
-            })
-          : prev.gap,
-      recommendations:
-        recommendations !== undefined
-          ? JSON.stringify({ recommendations })
-          : prev.recommendations,
-      article: typeof content === 'string' ? decodeUnicodeEscapes(content) : prev.article,
-      coverage:
-        coverageScore !== undefined || coverageSummary !== undefined || coverageCriteria !== undefined
-          ? JSON.stringify({
-              overall_score: coverageScore ?? null,
-              passed: coveragePassed ?? null,
-              summary: coverageSummary ?? '',
-              criteria: coverageCriteria ?? [],
-            })
-          : prev.coverage,
-    }));
-    setStages({ gap: 'done', recommendations: 'done', article: 'done', coverage: 'done' });
-  };
-
-  const run = async (input: EnhanceInput) => {
-    // Optimistic UI: reset everything and flip to running before the first byte.
-    lastInputRef.current = input;
-    accRef.current = {};
-    setPanels(EMPTY_PANELS);
-    setStages(PENDING_STAGES);
-    setErrorMessage('');
-    setElapsed(0);
-    setStatusMessage('Submitting article to the pipeline…');
-    setStatus('running');
-
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      const response = await fetch('/api/enhance', {
+      const res = await fetch('/api/enhance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
+        body: JSON.stringify({
+          article_url: input.articleUrl,
+          article_text: input.articleText,
+          content_type: input.contentType,
+        }),
         signal: controller.signal,
-      });
+      })
 
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text.slice(0, 500) || `Request failed with status ${response.status}.`);
+      if (!res.ok) {
+        const text = await res.text()
+        let message = text
+        try {
+          const parsedError = JSON.parse(text) as { error?: string }
+          if (parsedError.error) message = parsedError.error
+        } catch {
+          /* keep raw text */
+        }
+        throw new Error(message || `Request failed (${res.status})`)
       }
 
-      const contentType = response.headers.get('content-type') ?? '';
+      const contentType = res.headers.get('content-type') ?? ''
       if (contentType.includes('application/json')) {
-        const text = await response.text();
-        handleJsonFallback(text);
-        setStatus('done');
-        setStatusMessage('Enhancement complete');
-        return;
+        const text = await res.text()
+        const fallback = extractFallbackBuffers(text)
+        const next: SectionBuffers = { ...buffersRef.current, ...fallback }
+        buffersRef.current = next
+        setSections(next)
+        finishRun()
+        return
       }
 
-      const body = response.body;
-      if (!body) throw new Error('The server returned an empty response stream.');
+      if (!res.body) throw new Error('No response stream received')
 
-      const reader = body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let sawDone = false;
-      let streamEnded = false;
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let doneSeen = false
 
-      while (!streamEnded && !sawDone) {
-        const { done, value } = await reader.read();
-        if (done) {
-          streamEnded = true;
-          continue;
-        }
-        // Chunks arrive split mid-line: buffer bytes and only process complete lines.
-        buffer += decoder.decode(value, { stream: true });
-        let newlineIndex = buffer.indexOf('\n');
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let newlineIndex = buffer.indexOf('\n')
         while (newlineIndex >= 0) {
-          const line = buffer.slice(0, newlineIndex);
-          buffer = buffer.slice(newlineIndex + 1);
+          const line = buffer.slice(0, newlineIndex)
+          buffer = buffer.slice(newlineIndex + 1)
           if (processLine(line)) {
-            sawDone = true;
-            break;
+            doneSeen = true
+            break
           }
-          newlineIndex = buffer.indexOf('\n');
+          newlineIndex = buffer.indexOf('\n')
         }
+        if (doneSeen) break
       }
 
-      if (!sawDone && buffer.trim()) {
-        processLine(buffer);
-      }
-      finalizeRun();
-    } catch (error) {
-      if (controller.signal.aborted) {
-        // Cancelled by the user — restore idle state.
-        setStatus('idle');
-        setStatusMessage('');
-        setStages(PENDING_STAGES);
-        return;
-      }
-      setStatus('error');
-      setStatusMessage('');
-      setErrorMessage(
-        error instanceof Error && error.message
-          ? error.message
-          : 'Something went wrong while streaming results.'
-      );
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
+      if (!doneSeen && buffer.trim()) processLine(buffer)
+      finishRun()
+    } catch (err) {
+      if ((err instanceof DOMException || err instanceof Error) && err.name === 'AbortError') return
+      setErrorMessage(err instanceof Error ? err.message : 'Something went wrong while streaming results.')
+      setPhase('error')
     }
-  };
+  }
 
-  const cancel = () => {
-    abortRef.current?.abort();
-  };
+  const startRun = (input: EnhanceInput) => {
+    lastInputRef.current = input
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+    buffersRef.current = { ...EMPTY_BUFFERS }
+    unknownRef.current = {}
+    unknownMapRef.current = {}
+    activeStageRef.current = null
+    setSections({ ...EMPTY_BUFFERS })
+    setStages({ ...INITIAL_STAGES })
+    setErrorMessage(null)
+    setElapsed(0)
+    setStatusMessage('Submitting article\u2026')
+    setPhase('running')
+    void runStream(input, controller)
+  }
 
-  const retry = () => {
-    const input = lastInputRef.current;
-    if (input) void run(input);
-  };
+  const handleCancel = () => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    activeStageRef.current = null
+    buffersRef.current = { ...EMPTY_BUFFERS }
+    setSections({ ...EMPTY_BUFFERS })
+    setStages({ ...INITIAL_STAGES })
+    setStatusMessage('')
+    setErrorMessage(null)
+    setElapsed(0)
+    setPhase('idle')
+  }
 
-  const stageItems: StageItem[] = STAGE_ORDER.map((key) => ({
-    key,
-    label: STAGE_LABELS[key],
-    status: stages[key],
-  }));
+  const handleRetry = () => {
+    if (lastInputRef.current) startRun(lastInputRef.current)
+  }
 
-  const running = status === 'running';
-  const showResults = status !== 'idle';
+  const gapData = useMemo(() => parseGapAnalysis(sections.gap), [sections.gap])
+  const recommendationItems = useMemo(() => parseRecommendations(sections.recs), [sections.recs])
+  const coverageData = useMemo(() => parseCoverage(sections.coverage), [sections.coverage])
+  const articleContent = useMemo(() => decodeEscapes(sections.article), [sections.article])
+
+  const sectionStatus = (key: StageKey): SectionStatus => {
+    const hasData = sections[key].trim().length > 0
+    if (phase === 'running') return hasData ? 'streaming' : 'pending'
+    if (phase === 'done') return hasData ? 'done' : 'empty'
+    if (phase === 'error') return hasData ? 'done' : 'empty'
+    return 'pending'
+  }
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-4 py-10 sm:py-16">
-      <header className="text-center">
-        <p className="font-heading text-xs font-semibold uppercase tracking-[0.2em] text-accent-deep">
-          SEO Enhancement Pipeline
-        </p>
-        <h1 className="mt-3 font-heading text-4xl font-bold tracking-tight text-ink sm:text-5xl">
-          Article Enhancer
-        </h1>
-        <p className="mx-auto mt-4 max-w-xl text-sm leading-relaxed text-slate-500 sm:text-base">
-          Submit an article and watch the pipeline analyze gaps, generate recommendations, write an
-          enhanced draft, and verify coverage — live, as it happens.
+    <main className="mx-auto w-full max-w-3xl px-4 pb-20 pt-12 sm:pt-16">
+      <header className="mb-8 text-center">
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+          <Sparkles className="h-3.5 w-3.5" /> SEO enhancement pipeline
+        </span>
+        <h1 className="mt-4 font-heading text-4xl font-bold tracking-tight text-ink">Article Enhancer</h1>
+        <p className="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-slate-500">
+          Submit an article and watch the pipeline analyze gaps, generate recommendations, rewrite an enhanced
+          draft, and verify coverage \u2014 live, token by token.
         </p>
       </header>
 
-      <ArticleForm running={running} onSubmit={(input) => void run(input)} onCancel={cancel} />
+      <ArticleForm running={phase === 'running'} onSubmit={startRun} onCancel={handleCancel} />
 
-      {showResults && (
-        <section className="mt-8 space-y-6" aria-live="polite">
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-7">
-            {running && <div className="progress-line mb-5" aria-hidden="true" />}
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-              <h2 className="font-heading text-base font-semibold text-ink">Pipeline progress</h2>
-              <StatusChip message={statusMessage} elapsed={elapsed} running={running} />
-            </div>
-            <ProgressChecklist stages={stageItems} />
+      {phase !== 'idle' && (
+        <section className="mt-8" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <StatusChip message={statusMessage} elapsed={elapsed} running={phase === 'running'} />
           </div>
 
-          {status === 'error' && <ErrorCard message={errorMessage} onRetry={retry} />}
+          {phase === 'running' && <div className="progress-line mt-4" aria-hidden="true" />}
 
-          {panels.gap && <GapAnalysisCard raw={panels.gap} />}
-          {panels.recommendations && <RecommendationsCard raw={panels.recommendations} />}
-          {panels.article && (
-            <EnhancedArticleCard
-              content={panels.article}
-              streaming={running && stages.article === 'active'}
-            />
+          {phase === 'error' && (
+            <div className="section-enter mt-6 rounded-2xl border border-rose-200 bg-rose-50 p-5">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-600" />
+                <div className="min-w-0">
+                  <h2 className="font-heading text-sm font-semibold text-rose-800">Enhancement failed</h2>
+                  <p className="mt-1 break-words text-sm text-rose-700">{errorMessage}</p>
+                  <button
+                    type="button"
+                    onClick={handleRetry}
+                    className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rose-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:ring-offset-2"
+                  >
+                    <RotateCcw className="h-4 w-4" /> Retry
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
-          {panels.coverage && <CoverageCard raw={panels.coverage} />}
+
+          <div className="mt-6 grid items-start gap-6 lg:grid-cols-[230px_minmax(0,1fr)]">
+            <ProgressChecklist stages={stages} />
+            <div className="min-w-0 space-y-6">
+              <EnhancedArticleSection content={articleContent} status={sectionStatus('article')} />
+              <GapAnalysisSection data={gapData} raw={sections.gap} status={sectionStatus('gap')} />
+              <RecommendationsSection items={recommendationItems} raw={sections.recs} status={sectionStatus('recs')} />
+              <CoverageSection data={coverageData} raw={sections.coverage} status={sectionStatus('coverage')} />
+            </div>
+          </div>
         </section>
       )}
-    </div>
-  );
+    </main>
+  )
 }

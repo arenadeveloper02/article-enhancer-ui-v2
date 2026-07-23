@@ -1,10 +1,5 @@
-import EnhancerClient from '@/components/EnhancerClient';
-import ErrorBoundary from '@/components/ErrorBoundary';
+import EnhancerClient from '@/components/EnhancerClient'
 
 export default function HomePage() {
-  return (
-    <ErrorBoundary>
-      <EnhancerClient />
-    </ErrorBoundary>
-  );
+  return <EnhancerClient />
 }
